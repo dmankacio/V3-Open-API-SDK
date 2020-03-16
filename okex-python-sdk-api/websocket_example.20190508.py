@@ -198,7 +198,7 @@ sleepGate = 0.06 #下单延时阈值
 
 api_key = ''
 seceret_key = ''
-passphrase = 'WohtrTRNqKEsmFvJEDB3tcW4z'
+passphrase = ''
 url = 'wss://real.okex.com:10442/ws/v3'
 channels = ["swap/account:EOS-USD-SWAP", "swap/position:EOS-USD-SWAP", "swap/order:EOS-USD-SWAP"]
 
