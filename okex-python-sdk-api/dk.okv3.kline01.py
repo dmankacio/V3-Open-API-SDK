@@ -1,5 +1,7 @@
 #!/usr/bin/env python
-
+'''
+201905，收盘价超过3均线0.1%时开单或者平仓
+'''
 import asyncio
 import websockets
 import json
@@ -11,7 +13,37 @@ import zlib
 import hashlib
 import sqlite3
 
+import websocket,time,datetime
+import okex.swap_api as swap
+import okex.spot_api as spot
+
 conn = sqlite3.connect('darkCoin.db')
+
+pars = {'buyOrSell': 'buy'}
+newPrice = dict() #最新价
+myAccount = dict() #结构：{'instrument_id':{swap/account}}
+myPositionA = dict() #多仓
+myPositionB = dict() #空仓
+upOrderPair = dict() #多单对，当前价上下各浮动n%同时开多和平多，一边成交则撤单另一个 {'自定ID':'id','a单':{},'b单':{}}
+downOrderPair = dict() #空单对
+buyPctGate = 0.002 #开仓阈值
+marginRatioGate =  0.25 #保证金率阈值，低于此值停止开单| 保证金率=（账户余额+已实现盈亏+未实现盈亏）／（面值*张数／最新标记价格+冻结保证金*杠杆倍数）
+amount = 1 #开仓张数
+sleepGate = 0.06 #下单延时阈值
+positionGuardGate = 0.1 #持仓差异守护：为防止多空单持仓的差异过大，增加守护逻辑，超过阈值时停止数量多一边的加仓，量少的一边不停。
+candle300s = dict() #5分钟K线
+klineFlagGate = 0.001 #K线交易阈值
+
+api_key = ''
+seceret_key = ''
+passphrase = ''
+url = 'wss://real.okex.com:10442/ws/v3'
+swapAPI = swap.SwapAPI(api_key, seceret_key, passphrase, True)
+spotAPI = spot.SpotAPI(api_key, seceret_key, passphrase, True)
+# "spot/candle300s:EOS-USDT" 
+channels = ["swap/account:EOS-USD-SWAP", "swap/position:EOS-USD-SWAP", "swap/order:EOS-USD-SWAP", "swap/candle300s:EOS-USD-SWAP"]
+instrumentId = "EOS-USD-SWAP"
+
 #执行Insert Delete Update
 def saveLog(sql):
     print(f'sql:{sql}')
@@ -57,156 +89,18 @@ def login_params(timestamp, api_key, passphrase, secret_key):
     login_str = json.dumps(login_param)
     return login_str
 
+class Candle(object):
+    def __init__(self, time, open, high, low, close, volume):
+        self.time = time
+        self.open = open
+        self.high = high
+        self.low = low
+        self.close = close
+        self.volume = volume
+    def printC(self):
+        print(f"Candle: {self.time} >> {self.open}/{self.high}/{self.low}/{self.close}/{self.volume} ")
 
 
-# subscribe channel without login
-#
-# swap/ticker // 行情数据频道
-# swap/candle60s // 1分钟k线数据频道
-# swap/candle180s // 3分钟k线数据频道
-# swap/candle300s // 5分钟k线数据频道
-# swap/candle900s // 15分钟k线数据频道
-# swap/candle1800s // 30分钟k线数据频道
-# swap/candle3600s // 1小时k线数据频道
-# swap/candle7200s // 2小时k线数据频道
-# swap/candle14400s // 4小时k线数据频道
-# swap/candle21600 // 6小时k线数据频道
-# swap/candle43200s // 12小时k线数据频道
-# swap/candle86400s // 1day k线数据频道
-# swap/candle604800s // 1week k线数据频道
-# swap/trade // 交易信息频道
-# swap/funding_rate//资金费率频道
-# swap/price_range//限价范围频道
-# swap/depth //深度数据频道，首次200档，后续增量
-# swap/depth5 //深度数据频道，每次返回前5档
-# swap/mark_price// 标记价格频道
-async def subscribe_without_login(url, channels):
-    async with websockets.connect(url) as websocket:
-        sub_param = {"op": "subscribe", "args": channels}
-        sub_str = json.dumps(sub_param)
-        await  websocket.send(sub_str)
-        print(f"send: {sub_str}")
-
-        print("receive:")
-        res = await websocket.recv()
-        res = inflate(res)
-        print(f"{res}")
-
-        res = await websocket.recv()
-        res = inflate(res)
-        print(f"{res}")
-
-# subscribe channel need login
-#
-# swap/account //用户账户信息频道
-# swap/position //用户持仓信息频道
-# swap/order //用户交易数据频道
-async def subscribe(url, api_key, passphrase, secret_key, channels):
-    async with websockets.connect(url) as websocket:
-        # login
-        timestamp = str(server_timestamp())
-        login_str = login_params(str(timestamp), api_key, passphrase, secret_key)
-        await websocket.send(login_str)
-
-        login_res = await websocket.recv()
-        # print(f"receive < {login_res}")
-
-        sub_param = {"op": "subscribe", "args": channels}
-        sub_str = json.dumps(sub_param)
-        await  websocket.send(sub_str)
-        print(f"send: {sub_str}")
-
-        print("receive:")
-        res = await websocket.recv()
-        res = inflate(res)
-        print(f"{res}")
-
-        res = await websocket.recv()
-        res = inflate(res)
-        print(f"{res}")
-
-# unsubscribe channels
-async def unsubscribe(url, api_key, passphrase, secret_key, channels):
-    async with websockets.connect(url) as websocket:
-        timestamp = str(server_timestamp())
-
-        login_str = login_params(str(timestamp), api_key, passphrase, secret_key)
-
-        await websocket.send(login_str)
-
-        greeting = await websocket.recv()
-        # print(f"receive < {greeting}")
-
-        sub_param = {"op": "unsubscribe", "args": channels}
-        sub_str = json.dumps(sub_param)
-        await  websocket.send(sub_str)
-        print(f"send: {sub_str}")
-
-        res = await websocket.recv()
-        res = inflate(res)
-        print(f"server recv: {res}")
-
-# unsubscribe channels
-async def unsubscribe_without_login(url, channels):
-    async with websockets.connect(url) as websocket:
-        sub_param = {"op": "unsubscribe", "args": channels}
-        sub_str = json.dumps(sub_param)
-        await  websocket.send(sub_str)
-        print(f"send: {sub_str}")
-
-        res = await websocket.recv()
-        rest = inflate(res)
-        print(f"server recv: {rest}")
-
-
-def buildMySign(params,secretKey):
-    sign = ''
-    for key in sorted(params.keys()):
-        sign += key + '=' + str(params[key]) +'&'
-    return  hashlib.md5((sign+'secret_key='+secretKey).encode("utf-8")).hexdigest().upper()
-
-# trade for future
-def futureTrade(api_key,secretkey,symbol,contractType,price='',amount='',tradeType='',matchPrice='',leverRate=''):
-    params = {
-      'api_key':api_key,
-      'symbol':symbol,
-      'contract_type':contractType,
-      'amount':amount,
-      'type':tradeType,
-      'match_price':matchPrice,
-      'lever_rate':leverRate
-    }
-    if price:
-        params['price'] = price
-    sign = buildMySign(params,secretkey)
-    finalStr = "{'event':'addChannel','channel':'ok_futuresusd_trade','parameters':{'api_key':'"+api_key+"',\
-               'sign':'"+sign+"','symbol':'"+symbol+"','contract_type':'"+contractType+"'"
-    if price:
-        finalStr += ",'price':'"+price+"'"
-    finalStr += ",'amount':'"+amount+"','type':'"+tradeType+"','match_price':'"+matchPrice+"','lever_rate':'"+leverRate+"'},'binary':'true'}"
-    return finalStr
-
-newPrice = dict() #最新价
-myAccount = dict() #结构：{'instrument_id':{swap/account}}
-myPositionA = dict() #多仓
-myPositionB = dict() #空仓
-upOrderPair = dict() #多单对，当前价上下各浮动n%同时开多和平多，一边成交则撤单另一个 {'自定ID':'id','a单':{},'b单':{}}
-downOrderPair = dict() #空单对
-buyPctGate = 0.002 #开仓阈值
-marginRatioGate =  0.12 #保证金率阈值，低于此值停止开单| 保证金率=（账户余额+已实现盈亏+未实现盈亏）／（面值*张数／最新标记价格+冻结保证金*杠杆倍数）
-amount = 1 #开仓张数
-sleepGate = 0.06 #下单延时阈值
-positionGuardGate = 0.1 #持仓差异守护：为防止多空单持仓的差异过大，增加守护逻辑，超过阈值时停止数量多一边的加仓，量少的一边不停。
-
-api_key = ''
-seceret_key = ''
-passphrase = ''
-url = 'wss://real.okex.com:10442/ws/v3'
-channels = ["swap/account:EOS-USD-SWAP", "swap/position:EOS-USD-SWAP", "swap/order:EOS-USD-SWAP", "swap/ticker:EOS-USD-SWAP"]
-
-import websocket,time
-import okex.swap_api as swap
-swapAPI = swap.SwapAPI(api_key, seceret_key, passphrase, True)
 
 # 将订单保存到本地单对
 def refreshOrderPair(order, orderPair):
@@ -260,7 +154,7 @@ def takeOrder(instrumentId, myPstn, curPrice, inPrice, outPrice, typeUp, typeDow
     if myAccount is None or instrumentId not in myAccount:
         print(f"")
         return 0        
-    marginRatio = float(myAccount[instrumentId]['margin_ratio']) #保证金率
+    marginRatio = float(myAccount[instrumentId]['margin_ratio'], 1) #保证金率
     equity = float(myAccount[instrumentId]['equity']) #账户权益
     longMargin = myPositionA[instrumentId]['margin'] if instrumentId in myPositionA else 0
     shortMargin = myPositionB[instrumentId]['margin'] if instrumentId in myPositionB else 0
@@ -315,21 +209,83 @@ def takeOrder(instrumentId, myPstn, curPrice, inPrice, outPrice, typeUp, typeDow
         print(f'take order not action: {instrumentId}, clientOid={clientOid}')
         print(f'marginRatio:{marginRatio}, canOrderUp: {canOrderUp}, canOrderDown: {canOrderDown}, myPstn:{myPstn}')
 
-#根据当前价匹配最适价格
-def matchPrice(orderPrice, curNewPrice):
-    if 'last' not in curNewPrice:
-        #print('matchPrice --- last not in curNewPrice')
-        return orderPrice
-    else:
-        last = float(curNewPrice['last'])
-        best_bid = float(curNewPrice['best_bid'])
-        best_ask = float(curNewPrice['best_ask'])
-        if best_bid <= last and last <= best_ask:
-            #print(f'matchPrice --- curPrice = last {last}')
-            return last
+# 市价开单
+def takeOrderMatch(instrumentId):
+    buyOrSell = pars['buyOrSell']
+    print('...takeOrderMatch....', buyOrSell)
+    if myAccount is None or instrumentId not in myAccount:
+        print(f"cant take order, myAccount data is empty: {myAccount}")
+        return 0        
+    clientOid = 'dk' + time.strftime('%Y%m%d%H%M%S')
+    if buyOrSell == 'buy':
+        # 开单
+        mr = myAccount[instrumentId]['margin_ratio']
+        marginRatio = float(mr) if mr is not None and mr != '' else 1 #保证金率
+        if marginRatio > marginRatioGate:
+            #client_oid 是数字+字母（大小写）或者纯字母（大小写）类型 1-32位
+            logstr = f"take_order {buyOrSell}: ({instrumentId},{amount},{clientOid},'')"
+            print(logstr)
+            result = swapAPI.take_order(instrumentId,amount,'1','',clientOid,'1')
+            print('swapAPI.take_order.result-----', result)
+            if result['result'] == 'true':
+                buyOrSell = 'sell'
+                print(f"take_order.{buyOrSell}.order: {result['client_oid']}<->{result['order_id']} current flag: {buyOrSell}")
+                saveLog(f"insert into logs values(null,{time.strftime('%Y%m%d%H%M%S')},'swap/take_order','{logstr}')")
+            else:
+                print(f"take_order.error:{result['error_message']} >>>{buyOrSell}.order: {result['client_oid']}<->{result['order_id']}")
         else:
-            #print(f'matchPrice --- curPrice = last ({best_bid} + {best_ask}) / 2')
-            return (best_bid + best_ask) / 2
+            print(f"stop add order, margin ratio is low: {marginRatio}")
+    else:
+        if instrumentId not in myPositionA:
+            pars['buyOrSell'] = 'buy'
+            print(f'cant take order, myPositionA is empty:, {myPositionA} flag turn to {buyOrSell}')
+            return 0
+        # 平仓
+        curPosition = myPositionA[instrumentId]['avail_position']
+        if int(curPosition) >= amount:
+            logstr = f"take_order {buyOrSell}: ({instrumentId},{amount},{clientOid},'')"
+            print(logstr)
+            result = swapAPI.take_order(instrumentId,amount,'3','',clientOid,'1')
+            print('swapAPI.take_order.result-----', result)
+            if result['result'] == 'true':
+                buyOrSell = 'buy'
+                print(f"take_order.{buyOrSell}.order: {result['client_oid']}<->{result['order_id']} current flag: {buyOrSell}")
+                saveLog(f"insert into logs values(null,{time.strftime('%Y%m%d%H%M%S')},'swap/take_order','{logstr}')")
+            else:
+                print(f"take_order.error:{result['error_message']} >>>{buyOrSell}.order: {result['client_oid']}<->{result['order_id']}")
+        else:
+            buyOrSell = 'buy'
+            print(f'take order not action, position is low: {curPosition}, current flag turn to {buyOrSell}')
+    pars['buyOrSell'] = buyOrSell
+    print(f"pars['buyOrSell'] = {pars['buyOrSell']}")
+
+def klineMatch():
+    buyOrSell = pars['buyOrSell']
+    #print(f'---------------klineMatch--------------------------------------------------- {buyOrSell}')
+    sortKeys = sorted(candle300s)
+    #print('sortKeys:', type(sortKeys), sortKeys)
+    lastCandle = candle300s[sortKeys[-1]] #取最后一个K线
+    #print('lastCandle', lastCandle.__dict__)
+
+    closeLst = [candle300s[k].close for k in sortKeys[-3:]]
+    curAvg = sum(closeLst)/len(closeLst) #平均值
+    #print('close prices: ', closeLst, curAvg)
+
+    # L = [v.close for k,v in candle300s.items()]
+    # print(L)
+
+    lastClose = lastCandle.close #最新收盘价
+    if buyOrSell == 'buy' and lastClose/curAvg > (1+klineFlagGate):
+        #买入
+        print(f'will buy, lastClose:{lastClose}, curAverage:{curAvg}, lastClose/curAvg={lastClose/curAvg}')
+        takeOrderMatch(instrumentId)
+    elif buyOrSell == 'sell' and lastClose/curAvg < (1-klineFlagGate):
+        #卖出
+        print(f'will sell, lastClose:{lastClose}, curAverage:{curAvg}, lastClose/curAvg={lastClose/curAvg}')    
+        takeOrderMatch(instrumentId)
+    else:
+        print(f'buyOrSell: {buyOrSell}, lastClose:{lastClose}, curAverage:{curAvg}, lastClose/curAvg={lastClose/curAvg}  --- {buyOrSell}')
+
 
 def on_message(ws, message):
     # print('on_message.ws:', ws)
@@ -358,13 +314,20 @@ def on_message(ws, message):
     elif 'table' in resDict:
         resTbl = resDict['table']
         resData = resDict['data'] if 'data' in resDict else {}
-        if resTbl == 'swap/ticker': #最新价
-            #{"table": "swap/ticker","data": 
-            #[{"best_ask": "卖一","best_bid": "买一","last": "最新","high_24h": "5.7","low_24h": "5","timestamp": "2019-05-06T06:45:56.716Z","volume_24h": "1538076","instrument_id": "BTC-USD-SWAP"}]}
-            #更新账户状态
-            for lastPrice in resData:
-                newPrice[lastPrice['instrument_id']] = lastPrice
-                #print(f"{time.strftime('%H:%M:%S')} new Price {lastPrice['last']} - {lastPrice['best_ask']}/{lastPrice['best_bid']} ")
+        if resTbl == 'swap/candle300s': #最新价
+            #{"table": "spot/candle300s","data": 
+            #"candle":["2019-04-16T10:49:00.000Z","open","high","low","close","volume"]
+            #更新K线列表
+            for curCandle in resData:
+                tc = curCandle['candle']
+                aaT = time.strptime(tc[0][0:-1],'%Y-%m-%dT%H:%M:%S.%f')
+                timeVal = time.strftime("%Y%m%d%H%M", aaT)
+                #(f'time: {tc[0]} ---- {aaT} ---- {time.strftime("%Y%m%d%H%M%S", aaT)}')
+                newCandle = Candle(timeVal,float(tc[1]),float(tc[2]),float(tc[3]),float(tc[4]),float(tc[5]))
+                candle300s[newCandle.time] = newCandle
+                #newCandle.printC()
+            # 判断交易标志
+            klineMatch()
         if resTbl == 'swap/account': #账户状态
             #(f"account: {resData}")
             #更新账户状态
@@ -381,14 +344,14 @@ def on_message(ws, message):
                     else:
                         myPositionB[curOne['instrument_id']] = holdT
                         print(f"new short.position: {holdT['position']}")
-        if resTbl == 'swap/order': #订单
+        if resTbl == 'swap/order': #
+            return 1 #K线模式不处理订单
             #state 订单状态("-2":失败,"-1":撤单成功,"0":等待成交 ,"1":部分成交, "2":完全成交,"3":下单中,"4":撤单中,）
             #type 1:开多 2:开空 3:平多 4:平空
             #print(f"order: {resData}")
             for order in resData:
-                #curPrice = float(newPrice['last'] if 'last' in newPrice else order['price'])
-                curPrice = matchPrice(float(order['price']), newPrice[order['instrument_id']])
-                print(f"order.curPrice: {curPrice}, orderPrice: {order['price']}")
+                orderPrice = float(order['price'])
+                curPrice = float(newPrice['last']) if 'last' in newPrice else orderPrice
                 if order['type'] == '1' or order['type'] == '3':
                     curPair = upOrderPair
                     outPrice = curPrice * (1+buyPctGate)
@@ -415,8 +378,10 @@ def on_message(ws, message):
                     # 挂单成交，撤旧单，挂新单对
                     # 撤单
                     revokeOrder(order, curPair)
+                    print('撤单...')
                     # 开新单
                     takeOrder(order['instrument_id'], thisPosition, curPrice, inPrice, outPrice, odrTypeA, odrTypeB, actionType)
+                    print('开新单...')
                 elif order['state'] == '-1':
                     #撤单成功
                     print(f"revoke order successfull clientOid:{order['client_oid']}, orderId:{order['order_id']}")
@@ -446,13 +411,30 @@ def on_open(ws):
     #sub_str = json.dumps(sub_param)
 
     # login
-    timestamp = str(server_timestamp())
+    timestamp = server_timestamp()
     login_str = login_params(str(timestamp), api_key, passphrase, seceret_key)
     print(f"login: {login_str}")
     ws.send(login_str)
-    saveLog(f"insert into logs values(null,{time.strftime('%Y%m%d%H%M%S')},'login','user login')")
-
-
+    # saveLog(f"insert into logs values(null,{time.strftime('%Y%m%d%H%M%S')},'login','user login')")
+    
+    # 首次获取前200条kline
+    aaT = time.gmtime(timestamp-7200)
+    beginT = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", aaT)
+    endT = get_server_time()
+    # 时间粒度granularity必须是[60 180 300 900 1800 3600 7200 14400 21600 43200 86400 604800]中的任一值
+    # 分别对应的是[1min 3min 5min 15min 30min 1hour 2hour 4hour 6hour 12hour 1day 1week]的时间段
+    klines = swapAPI.get_kline('EOS-USD-SWAP', 300, beginT, endT)
+    #print(f"kline time: {beginT} -- {endT} >>> {klines}")
+    #更新K线列表
+    for tc in klines:
+        #tc = curCandle['candle']
+        aaT = time.strptime(tc[0][0:-1],'%Y-%m-%dT%H:%M:%S.%f')
+        timeVal = time.strftime("%Y%m%d%H%M", aaT)
+        (f'time: {tc[0]} ---- {aaT} ---- {time.strftime("%Y%m%d%H%M%S", aaT)}')
+        newCandle = Candle(timeVal,float(tc[1]),float(tc[2]),float(tc[3]),float(tc[4]),float(tc[5]))
+        candle300s[newCandle.time] = newCandle
+        newCandle.printC()
+        
 async def theManager(url):
     try:
         websocket.enableTrace(True)

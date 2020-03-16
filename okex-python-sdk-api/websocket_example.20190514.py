@@ -186,7 +186,6 @@ def futureTrade(api_key,secretkey,symbol,contractType,price='',amount='',tradeTy
     finalStr += ",'amount':'"+amount+"','type':'"+tradeType+"','match_price':'"+matchPrice+"','lever_rate':'"+leverRate+"'},'binary':'true'}"
     return finalStr
 
-newPrice = dict() #最新价
 myAccount = dict() #结构：{'instrument_id':{swap/account}}
 myPositionA = dict() #多仓
 myPositionB = dict() #空仓
@@ -315,22 +314,6 @@ def takeOrder(instrumentId, myPstn, curPrice, inPrice, outPrice, typeUp, typeDow
         print(f'take order not action: {instrumentId}, clientOid={clientOid}')
         print(f'marginRatio:{marginRatio}, canOrderUp: {canOrderUp}, canOrderDown: {canOrderDown}, myPstn:{myPstn}')
 
-#根据当前价匹配最适价格
-def matchPrice(orderPrice, curNewPrice):
-    if 'last' not in curNewPrice:
-        #print('matchPrice --- last not in curNewPrice')
-        return orderPrice
-    else:
-        last = float(curNewPrice['last'])
-        best_bid = float(curNewPrice['best_bid'])
-        best_ask = float(curNewPrice['best_ask'])
-        if best_bid <= last and last <= best_ask:
-            #print(f'matchPrice --- curPrice = last {last}')
-            return last
-        else:
-            #print(f'matchPrice --- curPrice = last ({best_bid} + {best_ask}) / 2')
-            return (best_bid + best_ask) / 2
-
 def on_message(ws, message):
     # print('on_message.ws:', ws)
     #print("receive:")
@@ -358,13 +341,6 @@ def on_message(ws, message):
     elif 'table' in resDict:
         resTbl = resDict['table']
         resData = resDict['data'] if 'data' in resDict else {}
-        if resTbl == 'swap/ticker': #最新价
-            #{"table": "swap/ticker","data": 
-            #[{"best_ask": "卖一","best_bid": "买一","last": "最新","high_24h": "5.7","low_24h": "5","timestamp": "2019-05-06T06:45:56.716Z","volume_24h": "1538076","instrument_id": "BTC-USD-SWAP"}]}
-            #更新账户状态
-            for lastPrice in resData:
-                newPrice[lastPrice['instrument_id']] = lastPrice
-                #print(f"{time.strftime('%H:%M:%S')} new Price {lastPrice['last']} - {lastPrice['best_ask']}/{lastPrice['best_bid']} ")
         if resTbl == 'swap/account': #账户状态
             #(f"account: {resData}")
             #更新账户状态
@@ -386,9 +362,7 @@ def on_message(ws, message):
             #type 1:开多 2:开空 3:平多 4:平空
             #print(f"order: {resData}")
             for order in resData:
-                #curPrice = float(newPrice['last'] if 'last' in newPrice else order['price'])
-                curPrice = matchPrice(float(order['price']), newPrice[order['instrument_id']])
-                print(f"order.curPrice: {curPrice}, orderPrice: {order['price']}")
+                curPrice = float(order['price'])
                 if order['type'] == '1' or order['type'] == '3':
                     curPair = upOrderPair
                     outPrice = curPrice * (1+buyPctGate)
